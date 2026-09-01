@@ -4496,6 +4496,39 @@ func TestApplyPulledPromptDeleteCreatesTombstoneAndRemovesPrompt(t *testing.T) {
 	}
 }
 
+func TestApplyPulledPromptUpsertCannotResurrectStaleTombstone(t *testing.T) {
+	s := newTestStore(t)
+	deletePayload := `{"sync_id":"prompt-tombstone-stale","session_id":"s-prompt","project":"engram","deleted":true,"deleted_at":"2026-01-02 00:00:00"}`
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "prompt-tombstone-stale", Op: SyncOpDelete, Payload: deletePayload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 2, Entity: SyncEntityPrompt, EntityKey: "prompt-tombstone-stale", Op: SyncOpUpsert, Payload: `{"sync_id":"prompt-tombstone-stale","session_id":"s-prompt","content":"stale","project":"engram","created_at":"2026-01-01 00:00:00"}`}); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts WHERE sync_id = 'prompt-tombstone-stale'`); got != 0 {
+		t.Fatalf("stale prompt resurrected: %d", got)
+	}
+}
+
+func TestApplyPulledObservationStaleActiveSnapshotCannotClearDelete(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("s-observation-order", "engram", "/tmp/engram"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityObservation, EntityKey: "obs-order", Op: SyncOpUpsert, Payload: `{"sync_id":"obs-order","session_id":"s-observation-order","type":"note","title":"v1","content":"v1","project":"engram","scope":"project","created_at":"2026-01-01 00:00:00","updated_at":"2026-01-01 00:00:00"}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 2, Entity: SyncEntityObservation, EntityKey: "obs-order", Op: SyncOpDelete, Payload: `{"sync_id":"obs-order","deleted_at":"2026-01-02 00:00:00"}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 3, Entity: SyncEntityObservation, EntityKey: "obs-order", Op: SyncOpUpsert, Payload: `{"sync_id":"obs-order","session_id":"s-observation-order","type":"note","title":"stale","content":"stale","project":"engram","scope":"project","created_at":"2026-01-01 00:00:00","updated_at":"2026-01-01 12:00:00"}`}); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM observations WHERE sync_id = 'obs-order' AND deleted_at IS NOT NULL`); got != 1 {
+		t.Fatalf("observation tombstone cleared by stale active snapshot: %d", got)
+	}
+}
+
 func TestApplyPulledPromptUpsertUpdatesCreatedAtOnExistingPrompt(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("s-prompt-upsert", "engram", "/tmp/engram"); err != nil {
@@ -5113,6 +5146,87 @@ func TestImportStoresObservationProjectAsText(t *testing.T) {
 	}
 	if storageClass != "text" {
 		t.Fatalf("project storage class = %q, want text", storageClass)
+	}
+}
+
+func TestImportUsesTimestampOrderingAndKeepsPromptIdentityImmutable(t *testing.T) {
+	s := newTestStore(t)
+	project := "engram"
+	base := ExportData{Sessions: []Session{{ID: "import-lww-session", Project: project, Directory: "/tmp", StartedAt: "2026-01-01 00:00:00"}}, Observations: []Observation{{SyncID: "import-lww-observation", SessionID: "import-lww-session", Type: "note", Title: "old", Content: "old", Project: &project, Scope: "project", CreatedAt: "2026-01-01 00:00:00", UpdatedAt: "2026-01-01 00:00:00"}}, Prompts: []Prompt{{SyncID: "import-immutable-prompt", SessionID: "import-lww-session", Content: "first", Project: project, CreatedAt: "2026-01-01 00:00:00"}}}
+	if _, err := s.Import(&base); err != nil {
+		t.Fatal(err)
+	}
+	newer := base
+	newer.Observations = []Observation{{SyncID: "import-lww-observation", SessionID: "import-lww-session", Type: "note", Title: "new", Content: "new", Project: &project, Scope: "project", CreatedAt: "2026-01-01 00:00:00", UpdatedAt: "2026-01-02 00:00:00"}}
+	newer.Prompts = []Prompt{{SyncID: "import-immutable-prompt", SessionID: "import-lww-session", Content: "must remain first", Project: project, CreatedAt: "2026-01-02 00:00:00"}}
+	if _, err := s.Import(&newer); err != nil {
+		t.Fatal(err)
+	}
+	older := newer
+	deletedAt := "2025-12-31 00:00:00"
+	older.Observations = []Observation{{SyncID: "import-lww-observation", SessionID: "import-lww-session", Type: "note", Title: "older", Content: "older", Project: &project, Scope: "project", CreatedAt: "2026-01-01 00:00:00", UpdatedAt: "2025-12-31 00:00:00", DeletedAt: &deletedAt}}
+	if _, err := s.Import(&older); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalarString(t, s, `SELECT title FROM observations WHERE sync_id = ?`, "import-lww-observation"); got != "new" {
+		t.Fatalf("title=%q, want newer import", got)
+	}
+	if got := scalarString(t, s, `SELECT content FROM user_prompts WHERE sync_id = ?`, "import-immutable-prompt"); got != "first" {
+		t.Fatalf("prompt=%q, want immutable original", got)
+	}
+}
+
+func TestImportPromptTombstoneUsesStrictLWW(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("missing-session", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO prompt_tombstones (sync_id, session_id, project, deleted_at) VALUES (?, ?, ?, ?)`, "import-prompt-tombstone", "missing-session", "engram", "2026-01-02 00:00:00"); err != nil {
+		t.Fatal(err)
+	}
+	stale := &ExportData{Prompts: []Prompt{{SyncID: "import-prompt-tombstone", SessionID: "missing-session", Content: "stale", Project: "engram", CreatedAt: "2026-01-01 00:00:00"}}}
+	if _, err := s.Import(stale); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts WHERE sync_id = 'import-prompt-tombstone'`); got != 0 {
+		t.Fatalf("stale prompt resurrected: %d", got)
+	}
+	newer := &ExportData{Prompts: []Prompt{{SyncID: "import-prompt-tombstone", SessionID: "missing-session", Content: "newer", Project: "engram", CreatedAt: "2026-01-03 00:00:00"}}}
+	result, err := s.Import(newer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PromptsImported != 1 {
+		t.Fatalf("newer prompt imports=%d, want 1", result.PromptsImported)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE sync_id = 'import-prompt-tombstone'`); got != 0 {
+		t.Fatalf("newer prompt left tombstone: %d", got)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM user_prompts WHERE sync_id = 'import-prompt-tombstone'`); got != 1 {
+		t.Fatalf("newer prompt rows=%d, want 1", got)
+	}
+}
+
+func TestImportOlderActiveObservationCannotClearLocalDeletion(t *testing.T) {
+	s := newTestStore(t)
+	project := "engram"
+	data := &ExportData{Sessions: []Session{{ID: "import-delete-order", Project: project, Directory: "/tmp", StartedAt: "2026-01-01 00:00:00"}}, Observations: []Observation{{SyncID: "import-delete-order-obs", SessionID: "import-delete-order", Type: "note", Title: "active", Content: "active", Project: &project, Scope: "project", CreatedAt: "2026-01-01 00:00:00", UpdatedAt: "2026-01-01 00:00:00"}}}
+	if _, err := s.Import(data); err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	if err := s.db.QueryRow(`SELECT id FROM observations WHERE sync_id = ?`, "import-delete-order-obs").Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteObservation(id, false); err != nil {
+		t.Fatal(err)
+	}
+	older := &ExportData{Observations: []Observation{{SyncID: "import-delete-order-obs", SessionID: "import-delete-order", Type: "note", Title: "stale active", Content: "stale active", Project: &project, Scope: "project", CreatedAt: "2026-01-01 00:00:00", UpdatedAt: "2025-12-31 00:00:00"}}}
+	if _, err := s.Import(older); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM observations WHERE sync_id = ? AND deleted_at IS NOT NULL`, "import-delete-order-obs"); got != 1 {
+		t.Fatalf("older active snapshot cleared local deletion: %d", got)
 	}
 }
 
@@ -8960,6 +9074,62 @@ func TestMergeProjectsCanonicalInSources(t *testing.T) {
 	}
 	if len(result.SourcesMerged) != 0 {
 		t.Errorf("expected empty SourcesMerged when all sources equal canonical, got %v", result.SourcesMerged)
+	}
+}
+
+func TestMergeProjectsCanonicalSourceDiscoversLegacyAliases(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "legacy-case-session", "Engram", "/work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, "legacy-case-obs", "legacy-case-session", "decision", "legacy", "content", "Engram", "project", "hash"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO prompt_tombstones (sync_id, session_id, project, deleted_at) VALUES (?, ?, ?, ?)`, "legacy-case-prompt", "legacy-case-session", "Engram", "2026-01-01 00:00:00"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.MergeProjects([]string{"engram"}, "engram")
+	if err != nil {
+		t.Fatalf("MergeProjects: %v", err)
+	}
+	if result.SessionsUpdated != 1 || result.ObservationsUpdated != 1 {
+		t.Fatalf("result=%+v, want legacy alias migrated", result)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM observations WHERE project = 'Engram'`); got != 0 {
+		t.Fatalf("legacy alias rows remaining: %d", got)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM prompt_tombstones WHERE project = 'engram'`); got != 1 {
+		t.Fatalf("prompt tombstones at canonical project = %d, want 1", got)
+	}
+}
+
+func TestEnsureEnrolledRepairSkipsCompleteProjectAndRepairsMissingMutation(t *testing.T) {
+	s := newTestStore(t)
+	for _, project := range []string{"repair-complete", "repair-missing"} {
+		if err := s.CreateSession(project+"-session", project, "/tmp/"+project); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.AddObservation(AddObservationParams{SessionID: project + "-session", Type: "note", Title: project, Content: project, Project: project, Scope: "project"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.EnrollProject(project); err != nil {
+			t.Fatal(err)
+		}
+	}
+	completeBefore := scalarInt(t, s, `SELECT count(*) FROM sync_mutations WHERE project = 'repair-complete'`)
+	if _, err := s.db.Exec(`DELETE FROM sync_mutations WHERE project = 'repair-missing' AND entity = ?`, SyncEntityObservation); err != nil {
+		t.Fatal(err)
+	}
+	missingBefore := scalarInt(t, s, `SELECT count(*) FROM sync_mutations WHERE project = 'repair-missing'`)
+	s.repairDone = false
+	if err := s.EnsureEnrolledProjectSyncMutations(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM sync_mutations WHERE project = 'repair-complete'`); got != completeBefore {
+		t.Fatalf("complete project mutations changed from %d to %d", completeBefore, got)
+	}
+	if got := scalarInt(t, s, `SELECT count(*) FROM sync_mutations WHERE project = 'repair-missing'`); got <= missingBefore {
+		t.Fatalf("missing project was not repaired: before=%d after=%d", missingBefore, got)
 	}
 }
 

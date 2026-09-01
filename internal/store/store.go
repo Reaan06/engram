@@ -4198,6 +4198,24 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 	// Import observations (use new IDs — AUTOINCREMENT, skip duplicate sync IDs)
 	for _, obs := range data.Observations {
 		syncID := normalizeExistingSyncID(obs.SyncID, "obs")
+		existing, lookupErr := s.getObservationBySyncIDTx(tx, syncID, true)
+		if lookupErr != nil && lookupErr != sql.ErrNoRows {
+			return nil, fmt.Errorf("import observation %d: %w", obs.ID, lookupErr)
+		}
+		if lookupErr == nil {
+			// Imports use the same timestamp ordering as sync pulls: an older
+			// snapshot must not overwrite content or resurrect a tombstone.
+			incoming := normalizeComparableTimestamp(obs.UpdatedAt)
+			current := normalizeComparableTimestamp(existing.UpdatedAt)
+			if incoming == "" || incoming <= current {
+				continue
+			}
+			if _, err := s.execHook(tx, `UPDATE observations SET session_id = ?, type = ?, title = ?, content = ?, tool_name = CAST(? AS TEXT), project = ?, scope = ?, topic_key = ?, normalized_hash = ?, revision_count = ?, duplicate_count = ?, last_seen_at = ?, review_after = ?, created_at = ?, updated_at = ?, deleted_at = ? WHERE id = ?`,
+				obs.SessionID, obs.Type, obs.Title, obs.Content, obs.ToolName, obs.Project, normalizeScope(obs.Scope), nullableString(normalizeTopicKey(derefString(obs.TopicKey))), hashNormalized(obs.Content), maxInt(obs.RevisionCount, 1), maxInt(obs.DuplicateCount, 1), obs.LastSeenAt, obs.ReviewAfter, obs.CreatedAt, obs.UpdatedAt, obs.DeletedAt, existing.ID); err != nil {
+				return nil, fmt.Errorf("import observation %d: %w", obs.ID, err)
+			}
+			continue
+		}
 		res, err := s.execHook(tx,
 			`INSERT INTO observations (sync_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash, revision_count, duplicate_count, last_seen_at, review_after, created_at, updated_at, deleted_at)
 			 SELECT ?, ?, ?, ?, ?, ?, CAST(? AS TEXT), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
@@ -4230,15 +4248,33 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 
 	// Import prompts
 	for _, p := range data.Prompts {
-		_, err := s.execHook(tx,
+		syncID := normalizeExistingSyncID(p.SyncID, "prompt")
+		var tombstoneDeletedAt string
+		if err := tx.QueryRow(`SELECT deleted_at FROM prompt_tombstones WHERE sync_id = ?`, syncID).Scan(&tombstoneDeletedAt); err == nil {
+			// A snapshot without an explicit deletion is still stale whenever a
+			// tombstone exists at or after its creation time. A newer snapshot is
+			// allowed by the existing prompt LWW contract.
+			if isStalePromptUpsert(syncPromptPayload{CreatedAt: p.CreatedAt}, tombstoneDeletedAt) {
+				continue
+			}
+			// A strictly newer snapshot supersedes the tombstone. Remove it
+			// before inserting so the prompt identity has one authoritative state.
+			if _, err := s.execHook(tx, `DELETE FROM prompt_tombstones WHERE sync_id = ?`, syncID); err != nil {
+				return nil, fmt.Errorf("import prompt %d: remove tombstone: %w", p.ID, err)
+			}
+		} else if err != sql.ErrNoRows {
+			return nil, fmt.Errorf("import prompt %d: %w", p.ID, err)
+		}
+		res, err := s.execHook(tx,
 			`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at)
-			 VALUES (?, ?, ?, ?, ?)`,
-			normalizeExistingSyncID(p.SyncID, "prompt"), p.SessionID, p.Content, p.Project, p.CreatedAt,
+			 SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM user_prompts WHERE sync_id = ?)`,
+			syncID, p.SessionID, p.Content, p.Project, p.CreatedAt, syncID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("import prompt %d: %w", p.ID, err)
 		}
-		result.PromptsImported++
+		n, _ := res.RowsAffected()
+		result.PromptsImported += int(n)
 	}
 
 	if err := s.commitHook(tx); err != nil {
@@ -5699,7 +5735,7 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 	// write path normalizes project names, so a rename must as well or the
 	// renamed records would carry a spelling no other route can produce.
 	newName, _ = NormalizeProject(newName)
-	if oldName == "" || newName == "" || oldName == newName {
+	if oldName == "" || newName == "" {
 		return &MigrateResult{}, nil
 	}
 
@@ -5717,31 +5753,53 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 	if err != nil {
 		return nil, fmt.Errorf("check old project: %w", err)
 	}
-	if !exists {
+	oldNormalized, _ := NormalizeProject(oldName)
+	if !exists && oldNormalized != newName {
 		return &MigrateResult{}, nil
 	}
 
-	result := &MigrateResult{Migrated: true}
+	result := &MigrateResult{}
 
 	err = s.withTx(func(tx *sql.Tx) error {
+		sources := []string{oldName}
+		if oldNormalized == newName {
+			aliases, aliasErr := s.projectMergeStoredAliasesTx(tx, newName)
+			if aliasErr != nil {
+				return fmt.Errorf("find aliases: %w", aliasErr)
+			}
+			sources = aliases
+			if strings.TrimSpace(oldName) != newName {
+				sources = append(sources, oldName)
+			}
+		}
+		if len(sources) == 0 || (len(sources) == 1 && strings.TrimSpace(sources[0]) == newName) {
+			return nil
+		}
+		placeholders := sqlPlaceholders(len(sources))
+		args := make([]any, 0, len(sources)+1)
+		args = append(args, newName)
+		for _, source := range sources {
+			args = append(args, strings.TrimSpace(source))
+		}
 		// FTS triggers handle index updates automatically on UPDATE
-		res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project = ?`, newName, oldName)
+		res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return fmt.Errorf("migrate observations: %w", err)
 		}
 		result.ObservationsUpdated, _ = res.RowsAffected()
 
-		res, err = s.execHook(tx, `UPDATE sessions SET project = ? WHERE project = ?`, newName, oldName)
+		res, err = s.execHook(tx, `UPDATE sessions SET project = ? WHERE project IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return fmt.Errorf("migrate sessions: %w", err)
 		}
 		result.SessionsUpdated, _ = res.RowsAffected()
 
-		res, err = s.execHook(tx, `UPDATE user_prompts SET project = ? WHERE project = ?`, newName, oldName)
+		res, err = s.execHook(tx, `UPDATE user_prompts SET project = ? WHERE project IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return fmt.Errorf("migrate prompts: %w", err)
 		}
 		result.PromptsUpdated, _ = res.RowsAffected()
+		result.Migrated = result.ObservationsUpdated > 0 || result.SessionsUpdated > 0 || result.PromptsUpdated > 0
 
 		// Migrate the old name's sync identity — pending journal rows and
 		// enrollment — so renaming a project (including one that was
@@ -5749,7 +5807,7 @@ func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) 
 		// exact spelling whose records moved above is migrated: a distinct
 		// project stored under the normalized spelling keeps its own journal
 		// rows and enrollment.
-		if err := s.migrateProjectSyncIdentityTx(tx, []string{oldName}, newName); err != nil {
+		if err := s.migrateProjectSyncIdentityTx(tx, sources, newName); err != nil {
 			return fmt.Errorf("migrate sync identity: %w", err)
 		}
 
@@ -6009,15 +6067,19 @@ func (s *Store) MergeProjects(sources []string, canonical string) (*MergeResult,
 		seenSources := make(map[string]struct{})
 		for i, srcInput := range sources {
 			srcNormalized := validatedSources[i]
-			if srcInput == canonical {
-				continue
-			}
 			if _, seen := seenSources[srcInput]; seen {
 				continue
 			}
 			seenSources[srcInput] = struct{}{}
 
 			sourceVariants := projectMergeSourceVariants(srcInput, srcNormalized, canonical)
+			if srcInput == canonical {
+				var err error
+				sourceVariants, err = s.projectMergeStoredAliasesTx(tx, canonical)
+				if err != nil {
+					return fmt.Errorf("find aliases for %q: %w", canonical, err)
+				}
+			}
 			if len(sourceVariants) == 0 {
 				continue
 			}
@@ -6089,6 +6151,44 @@ func projectMergeSourceVariants(rawSource, normalizedSource, canonical string) [
 		return nil
 	}
 	return []string{rawSource}
+}
+
+// projectMergeStoredAliasesTx discovers legacy spellings that were written
+// before project names were normalized. Only values whose shared normalizer
+// equals canonical are returned; similarly named projects are never guessed.
+func (s *Store) projectMergeStoredAliasesTx(tx *sql.Tx, canonical string) ([]string, error) {
+	rows, err := tx.Query(`SELECT project FROM (
+		SELECT project FROM observations WHERE project IS NOT NULL
+		UNION SELECT project FROM sessions WHERE project IS NOT NULL
+		UNION SELECT project FROM user_prompts WHERE project IS NOT NULL
+		UNION SELECT project FROM prompt_tombstones WHERE project IS NOT NULL
+		UNION SELECT project FROM sync_enrolled_projects WHERE project IS NOT NULL
+	) WHERE trim(project) != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := map[string]struct{}{}
+	var aliases []string
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		trimmed := strings.TrimSpace(raw)
+		normalized, _ := NormalizeProject(trimmed)
+		if trimmed != canonical && normalized == canonical {
+			if _, ok := seen[trimmed]; !ok {
+				seen[trimmed] = struct{}{}
+				aliases = append(aliases, trimmed)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Strings(aliases)
+	return aliases, nil
 }
 
 // migrateProjectSyncIdentityTx moves the pending sync journal rows and the
@@ -6165,6 +6265,12 @@ func (s *Store) migrateProjectSyncIdentityTx(tx *sql.Tx, sources []string, canon
 		variantArgs...,
 	); err != nil {
 		return fmt.Errorf("supersede source sync enrollment: %w", err)
+	}
+	if _, err := s.execHook(tx,
+		`UPDATE prompt_tombstones SET project = ? WHERE project IN (`+placeholders+`)`,
+		append([]any{canonical}, variantArgs...)...,
+	); err != nil {
+		return fmt.Errorf("migrate prompt tombstones: %w", err)
 	}
 	return nil
 }
@@ -6654,9 +6760,32 @@ func (s *Store) EnsureEnrolledProjectSyncMutations(ctx context.Context) error {
 }
 
 func (s *Store) repairEnrolledProjectSyncMutations() error {
-	// Collect enrolled projects outside a transaction so we avoid holding a read
-	// cursor open while we later write inside backfillProjectSyncMutationsTx.
-	rows, err := s.db.Query(`SELECT project FROM sync_enrolled_projects ORDER BY project ASC`)
+	// Find missing projects in one set-based query. The previous implementation
+	// ran four full completeness scans for every enrolled project, making repair
+	// scale as projects × rows.
+	rows, err := s.db.Query(`SELECT project FROM sync_enrolled_projects sep
+		WHERE EXISTS (
+			SELECT 1 FROM sessions x WHERE x.project = sep.project AND trim(x.id, ?) != ''
+			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.id AND sm.source = ?)
+			UNION ALL
+			SELECT 1 FROM observations o LEFT JOIN sessions os ON os.id = o.session_id
+			 WHERE (ifnull(o.project,'') = sep.project OR (ifnull(o.project,'') = '' AND ifnull(os.project,'') = sep.project)) AND o.deleted_at IS NULL
+			 AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = o.sync_id AND sm.source = ?)
+			UNION ALL
+			SELECT 1 FROM user_prompts p LEFT JOIN sessions ps ON ps.id = p.session_id
+			 WHERE (ifnull(p.project,'') = sep.project OR (ifnull(p.project,'') = '' AND ifnull(ps.project,'') = sep.project))
+			 AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = p.sync_id AND sm.source = ?)
+			UNION ALL
+			SELECT 1 FROM memory_relations r JOIN observations src ON src.sync_id = r.source_id AND src.deleted_at IS NULL
+			 JOIN observations tgt ON tgt.sync_id = r.target_id AND tgt.deleted_at IS NULL LEFT JOIN sessions rs ON rs.id = src.session_id
+			 WHERE r.judgment_status NOT IN (?, ?) AND ifnull(r.marked_by_actor,'') != '' AND ifnull(r.marked_by_kind,'') != ''
+			 AND coalesce(nullif(src.project,''), rs.project, '') = sep.project
+			 AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = r.sync_id AND sm.source = ?)
+		) ORDER BY project ASC`,
+		sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal,
+		DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal,
+		DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal,
+		JudgmentStatusOrphaned, JudgmentStatusPending, DefaultSyncTargetKey, SyncEntityRelation, SyncSourceLocal)
 	if err != nil {
 		return err
 	}
@@ -6676,14 +6805,6 @@ func (s *Store) repairEnrolledProjectSyncMutations() error {
 	}
 
 	for _, project := range projects {
-		// Fast path: if the project is already fully backfilled, skip the write tx entirely.
-		needs, err := s.projectNeedsBackfill(project)
-		if err != nil {
-			return err
-		}
-		if !needs {
-			continue
-		}
 		if err := s.withTx(func(tx *sql.Tx) error {
 			return s.backfillProjectSyncMutationsTx(tx, project)
 		}); err != nil {
@@ -7842,6 +7963,9 @@ func (s *Store) applyObservationUpsertTx(tx *sql.Tx, payload syncObservationPayl
 	if strings.TrimSpace(payload.UpdatedAt) == "" {
 		updatedAt = existing.UpdatedAt
 	}
+	if strings.TrimSpace(payload.UpdatedAt) != "" && normalizeComparableTimestamp(payload.UpdatedAt) < normalizeComparableTimestamp(existing.UpdatedAt) {
+		return nil
+	}
 
 	_, err = s.execHook(tx,
 		`UPDATE observations
@@ -7883,9 +8007,12 @@ func (s *Store) applyObservationDeleteTx(tx *sql.Tx, payload syncObservationPayl
 		now := Now()
 		deletedAt = &now
 	}
+	if normalizeComparableTimestamp(*deletedAt) < normalizeComparableTimestamp(existing.UpdatedAt) {
+		return nil
+	}
 	_, err = s.execHook(tx,
-		`UPDATE observations SET deleted_at = ?, updated_at = datetime('now') WHERE id = ?`,
-		deletedAt, existing.ID,
+		`UPDATE observations SET deleted_at = ?, updated_at = ? WHERE id = ?`,
+		deletedAt, *deletedAt, existing.ID,
 	)
 	return err
 }
